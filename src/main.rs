@@ -12,21 +12,26 @@ use aws_smithy_async::rt::sleep::default_async_sleep;
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
+const ITALIC: &str = "\x1b[3m";
+
+// Colors
+const GREEN: &str = "\x1b[32m";
+const YELLOW: &str = "\x1b[33m";
+const RED: &str = "\x1b[31m";
+const CYAN: &str = "\x1b[36m";
+const BLUE: &str = "\x1b[34m";
+const MAGENTA: &str = "\x1b[35m";
+const WHITE: &str = "\x1b[37m";
+const GRAY: &str = "\x1b[90m";
+const LIGHT_GRAY: &str = "\x1b[37m";
 
 // State colors
-const GREEN: &str = "\x1b[32m";      // Success/running
-const YELLOW: &str = "\x1b[33m";     // Warning/stopping/waiting
-const RED: &str = "\x1b[31m";        // Error/stopped/terminate
-const CYAN: &str = "\x1b[36m";       // Info
-const BLUE: &str = "\x1b[34m";       // Neutral
-
-// State-specific colors
-const STATE_RUNNING: &str = "\x1b[32m";    // Bright green
-const STATE_STOPPED: &str = "\x1b[33m";    // Yellow
-const STATE_STOPPING: &str = "\x1b[33m";   // Yellow (dim)
-const STATE_PENDING: &str = "\x1b[36m";    // Cyan
-const STATE_SHUTTING_DOWN: &str = "\x1b[31m"; // Red
-const STATE_TERMINATED: &str = "\x1b[90m";  // Gray
+const STATE_RUNNING: &str = "\x1b[92m";    // Bright green
+const STATE_STOPPED: &str = "\x1b[91m";    // Bright red
+const STATE_STOPPING: &str = "\x1b[93m";   // Bright yellow
+const STATE_PENDING: &str = "\x1b[96m";    // Bright cyan
+const STATE_SHUTTING_DOWN: &str = "\x1b[91m"; // Bright red
+const STATE_TERMINATED: &str = GRAY;
 
 fn state_color(state: &str) -> &'static str {
     match state.to_lowercase().as_str() {
@@ -36,7 +41,7 @@ fn state_color(state: &str) -> &'static str {
         "stopped" => STATE_STOPPED,
         "shutting-down" => STATE_SHUTTING_DOWN,
         "terminated" => STATE_TERMINATED,
-        _ => RESET,
+        _ => GRAY,
     }
 }
 
@@ -45,8 +50,8 @@ fn state_emoji(state: &str) -> &str {
         "running" => "🟢",
         "pending" => "🔵",
         "stopping" => "🟡",
-        "stopped" => "⭕",
-        "shutting-down" => "🔴",
+        "stopped" => "🔴",
+        "shutting-down" => "💥",
         "terminated" => "⚫",
         _ => "⚪",
     }
@@ -260,30 +265,32 @@ async fn cmd_list(client: &Client, states: Option<String>) -> Vec<u8> {
     let instances = describe_instances(client, &states_vec).await;
 
     if instances.is_empty() {
-        let msg = format!("{}🔍 No instances found.{}\n", RED, RESET);
-        return msg.into_bytes();
+        return format!("\n{}🔍 No instances found.{}\n", RED, RESET).into_bytes();
     }
 
-    // Build a colorized table output
     let mut output = Vec::new();
-    output.extend_from_slice(&format!("\n{}{}{} ({} instance{}){}\n", BOLD, CYAN, "EC2 Instances", instances.len(), if instances.len() == 1 {""} else {"s"}, RESET).into_bytes());
+    
+    // Header
+    output.extend_from_slice(&format!("\n{}🖥️  EC2 Instances{}\n", BOLD, RESET).into_bytes());
+    output.extend_from_slice(&format!("{}   {} {} instances{}\n", GRAY, instances.len(), if instances.len() == 1 {"instance"} else {"instances"}, RESET).into_bytes());
+    output.extend_from_slice(b"\n");
     
     // Table header
     output.extend_from_slice(&format!(
-        "  {} | {} | {} | {} | {}\n",
-        format!("{}ID{}", BOLD, RESET),
-        format!("{}Name{}", BOLD, RESET),
-        format!("{}Type{}", BOLD, RESET),
-        format!("{}State{}", BOLD, RESET),
-        format!("{}IP{}", BOLD, RESET)
+        "   {} | {} | {} | {} | {}\n",
+        format!("{}📛 ID{}", BOLD, RESET),
+        format!("{}🏷️ Name{}", BOLD, RESET),
+        format!("{}💻 Type{}", BOLD, RESET),
+        format!("{}📊 State{}", BOLD, RESET),
+        format!("{}🌐 IP{}", BOLD, RESET)
     ).into_bytes());
     
     // Separator
-    output.extend_from_slice(b"  ---|------|------|------|------\n");
+    output.extend_from_slice(b"   ---|------|------|------|------\n");
     
     // Table rows
     for inst in &instances {
-        let state_colored = format!("{}{}{}", state_color(&inst.state), inst.state, RESET);
+        let state_colored = format!("{}{}{} {}", state_color(&inst.state), state_emoji(&inst.state), inst.state.to_uppercase(), RESET);
         let name_colored = if inst.name != "-" {
             format!("{}{}{}", BOLD, inst.name, RESET)
         } else {
@@ -291,8 +298,7 @@ async fn cmd_list(client: &Client, states: Option<String>) -> Vec<u8> {
         };
         
         output.extend_from_slice(&format!(
-            "  {} | {} {} | {} | {} | {}\n",
-            state_emoji(&inst.state),
+            "   {} | {} | {} | {} | {}\n",
             inst.instance_id,
             name_colored,
             inst.instance_type,
@@ -301,6 +307,7 @@ async fn cmd_list(client: &Client, states: Option<String>) -> Vec<u8> {
         ).into_bytes());
     }
     
+    output.extend_from_slice(b"\n");
     output
 }
 
@@ -318,7 +325,7 @@ async fn cmd_start(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
         .unwrap();
 
     let mut output = Vec::new();
-    output.extend_from_slice(&format!("{}⏳ Waiting for instances to start...{}\n", YELLOW, RESET).into_bytes());
+    output.extend_from_slice(&format!("\n{}▶️  Starting {} instance(s)...{}\n", CYAN, ids.len(), RESET).into_bytes());
 
     client
         .wait_until_instance_running()
@@ -327,7 +334,7 @@ async fn cmd_start(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
         .await
         .unwrap();
 
-    output.extend_from_slice(&format!("{}✅ Instance(s) {} are now running{}\n", GREEN, ids.join(", "), RESET).into_bytes());
+    output.extend_from_slice(&format!("{}✅ Instance(s) {} is now running{}\n", GREEN, ids.join(", "), RESET).into_bytes());
     output
 }
 
@@ -344,7 +351,7 @@ async fn cmd_stop(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
         .await
         .unwrap();
 
-    format!("{}⏹️ Instance(s) {} stopped{}\n", YELLOW, ids.join(", "), RESET).into_bytes()
+    format!("\n{}⏹️  Instance(s) {} stopped{}\n", YELLOW, ids.join(", "), RESET).into_bytes()
 }
 
 async fn cmd_restart(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
@@ -354,7 +361,7 @@ async fn cmd_restart(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
     }
 
     let mut output = Vec::new();
-    output.extend_from_slice(&format!("{}⏹️ Stopping instances...{}\n", YELLOW, RESET).into_bytes());
+    output.extend_from_slice(&format!("\n{}⏹️  Stopping {} instance(s)...{}\n", YELLOW, ids.len(), RESET).into_bytes());
 
     client
         .stop_instances()
@@ -370,7 +377,7 @@ async fn cmd_restart(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
         .await
         .unwrap();
 
-    output.extend_from_slice(&format!("{}▶️ Starting instances...{}\n", YELLOW, RESET).into_bytes());
+    output.extend_from_slice(&format!("{}▶️ Starting {} instance(s)...{}\n", CYAN, ids.len(), RESET).into_bytes());
 
     client
         .start_instances()
@@ -397,7 +404,7 @@ async fn cmd_wait(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
     }
 
     let mut output = Vec::new();
-    output.extend_from_slice(&format!("{}⏳ Waiting for instances to stop...{}\n", YELLOW, RESET).into_bytes());
+    output.extend_from_slice(&format!("\n{}⏳ Waiting for {} instance(s) to stop...{}\n", YELLOW, ids.len(), RESET).into_bytes());
 
     client
         .wait_until_instance_stopped()
@@ -417,9 +424,9 @@ async fn cmd_change_type(client: &Client, instance_type: String, instance_ids: V
     }
 
     let mut output = Vec::new();
-    for id in &ids {
-        output.extend_from_slice(&format!("{}🔄 Changing {} to {}...{}\n", YELLOW, id, instance_type, RESET).into_bytes());
+    output.extend_from_slice(&format!("\n{}🔄 Changing instance types...{}\n", CYAN, RESET).into_bytes());
 
+    for id in &ids {
         client
             .modify_instance_attribute()
             .instance_id(id)
@@ -430,8 +437,10 @@ async fn cmd_change_type(client: &Client, instance_type: String, instance_ids: V
             .await
             .unwrap();
 
-        output.extend_from_slice(&format!("{}✅ Instance {} type changed to {}{}\n", GREEN, id, instance_type, RESET).into_bytes());
+        output.extend_from_slice(&format!("   {} {} → {}{}\n", id, MAGENTA, instance_type, RESET).into_bytes());
     }
+
+    output.extend_from_slice(&format!("\n{}✅ Instance type(s) updated{}\n", GREEN, RESET).into_bytes());
     output
 }
 
@@ -443,7 +452,7 @@ async fn cmd_terminate(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
 
     let instances = describe_instances_by_ids(client, &ids).await;
     let table = Table::new(&instances);
-    let mut output = format!("\n{}🗑️ Instances to terminate:{}\n{}", RED, RESET, table.to_string()).into_bytes();
+    let mut output = format!("\n{}🗑️ Instances to terminate:{}\n{}", BOLD, RESET, table.to_string()).into_bytes();
 
     output.extend_from_slice(&format!("\n{}⚠️  WARNING: Termination permanently deletes the instance!{}\n", RED, RESET).into_bytes());
     output.extend_from_slice(&format!("{}Type \"terminate\" to confirm:{}\n", YELLOW, RESET).into_bytes());
@@ -466,7 +475,7 @@ async fn cmd_terminate(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
         .unwrap();
 
     output.clear();
-    output.extend_from_slice(&format!("{}✅ Instance(s) {} terminated successfully{}\n", GREEN, ids.join(", "), RESET).into_bytes());
+    output.extend_from_slice(&format!("\n{}✅ Instance(s) {} terminated successfully{}\n", GREEN, ids.join(", "), RESET).into_bytes());
     output
 }
 
@@ -481,14 +490,19 @@ async fn resolve_instance_ids(client: &Client, provided_ids: &[String]) -> Vec<S
         return Vec::new();
     }
 
-    println!("\n{}🔍 Available instances:{}", CYAN, RESET);
+    println!("\n{}🔍 Available instances:{}\n", CYAN, RESET);
     for (i, inst) in instances.iter().enumerate() {
-        let state_colored = format!("{}{}{}", state_color(&inst.state), inst.state, RESET);
+        let state_colored = format!("{}{} {}{}", state_color(&inst.state), state_emoji(&inst.state), inst.state.to_uppercase(), RESET);
+        let name_display = if inst.name != "-" {
+            format!("{}{}{}", BOLD, inst.name, RESET)
+        } else {
+            format!("{}{}{}", DIM, inst.name, RESET)
+        };
         println!(
             "  {}. {} | {} | {} | {}",
             i + 1,
             inst.instance_id,
-            inst.name,
+            name_display,
             inst.instance_type,
             state_colored
         );
