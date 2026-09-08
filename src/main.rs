@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use tabled::{Table, Tabled};
 
 use aws_sdk_ec2::client::Waiters;
+use aws_smithy_async::rt::sleep::default_async_sleep;
 
 #[derive(Parser)]
 #[command(name = "ec2", about = "EC2 instance management CLI", version)]
@@ -98,7 +99,14 @@ fn set_profile(profile: &str) {
 
 async fn get_client(profile: &str) -> Client {
     set_profile(profile);
-    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let config = aws_config::load_from_env().await;
+
+    // Set the async sleep implementation required by the retry system
+    let config = config
+        .to_builder()
+        .sleep_impl(default_async_sleep().unwrap())
+        .build();
+
     Client::new(&config)
 }
 

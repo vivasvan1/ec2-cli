@@ -7,7 +7,8 @@ description = "A CLI tool for managing AWS EC2 instances"
 [dependencies]
 clap = { version = "4", features = ["derive", "cargo"] }
 aws-sdk-ec2 = { version = "1.255", default-features = false, features = ["rustls"] }
-aws-config = { version = "1.5", default-features = false, features = ["rustls"] }
+aws-config = { version = "1.5", default-features = false, features = ["rustls", "behavior-version-latest", "sso"] }
+aws-smithy-async = { version = "1.3", features = ["rt-tokio"] }
 tokio = { version = "1", features = ["full"] }
 tabled = "0.17"
 color-print = "0.3"
