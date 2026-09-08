@@ -290,10 +290,24 @@ async fn cmd_list(client: &Client, states: Option<String>) -> Vec<u8> {
         return msg.into_bytes();
     }
 
+    // Build a colorized table output
     let mut output = Vec::new();
     output.extend_from_slice(&format!("\n{}{}{} ({} instance{}){}\n", BOLD, CYAN, "EC2 Instances", instances.len(), if instances.len() == 1 {""} else {"s"}, RESET).into_bytes());
     
-    // Build a colorized table output
+    // Table header
+    output.extend_from_slice(&format!(
+        "  {} | {} | {} | {} | {}\n",
+        format!("{}ID{}", BOLD, RESET),
+        format!("{}Name{}", BOLD, RESET),
+        format!("{}Type{}", BOLD, RESET),
+        format!("{}State{}", BOLD, RESET),
+        format!("{}IP{}", BOLD, RESET)
+    ).into_bytes());
+    
+    // Separator
+    output.extend_from_slice(b"  ---|------|------|------|------\n");
+    
+    // Table rows
     for inst in &instances {
         let state_colored = format!("{}{}{}", state_color(&inst.state), inst.state, RESET);
         let name_colored = if inst.name != "-" {
@@ -303,8 +317,9 @@ async fn cmd_list(client: &Client, states: Option<String>) -> Vec<u8> {
         };
         
         output.extend_from_slice(&format!(
-            "  {} {} | {} | {} | {}\n",
+            "  {} | {} {} | {} | {} | {}\n",
             state_emoji(&inst.state),
+            inst.instance_id,
             name_colored,
             inst.instance_type,
             state_colored,
