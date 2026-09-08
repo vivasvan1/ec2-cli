@@ -1,4 +1,5 @@
-use std::io::Write;
+use std::io::{Write, IsTerminal};
+use std::process::Command;
 
 use aws_sdk_ec2::types::{Filter, Instance, Tag};
 use aws_sdk_ec2::Client;
@@ -11,18 +12,55 @@ use aws_smithy_async::rt::sleep::default_async_sleep;
 #[derive(Parser)]
 #[command(name = "ec2", about = "EC2 instance management CLI", version)]
 struct Cli {
-    /// AWS profile to use (default: ml-dev)
-    #[arg(short, long, default_value = "ml-dev")]
-    profile: String,
+    /// Use less pager for output (default: auto when stdout is a terminal)
+    #[arg(long)]
+    pager: Option<bool>,
 
     #[command(subcommand)]
     command: Commands,
+}
+
+fn should_use_pager(cli: &Cli) -> bool {
+    match cli.pager {
+        Some(v) => v,
+        None => std::io::stdout().is_terminal(),
+    }
+}
+
+fn pipe_to_pager() -> std::process::Child {
+    Command::new("less")
+        .arg("-R") // pass through ANSI color codes
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .spawn()
+        .expect("Failed to spawn less")
+}
+
+fn run_with_pager<F>(f: F) 
+where
+    F: FnOnce() -> std::process::Child,
+{
+    let mut child = f();
+    let status = child.wait().expect("Failed to wait for pager");
+    if !status.success() {
+        eprintln!("pager exited with status: {}", status);
+    }
+}
+
+#[derive(Parser, Clone)]
+struct ProfileArgs {
+    /// AWS profile to use (default: ml-dev)
+    #[arg(short, long, default_value = "ml-dev")]
+    profile: String,
 }
 
 #[derive(Subcommand)]
 enum Commands {
     /// List all EC2 instances
     List {
+        #[command(flatten)]
+        profile: ProfileArgs,
+
         /// Filter by instance state (comma-separated, e.g. running,stopped)
         #[arg(short, long)]
         state: Option<String>,
@@ -30,6 +68,9 @@ enum Commands {
 
     /// Start one or more EC2 instances
     Start {
+        #[command(flatten)]
+        profile: ProfileArgs,
+
         /// Instance IDs (if omitted, interactive selection)
         #[arg(value_name = "INSTANCE_ID")]
         instance_ids: Vec<String>,
@@ -37,6 +78,9 @@ enum Commands {
 
     /// Stop one or more EC2 instances
     Stop {
+        #[command(flatten)]
+        profile: ProfileArgs,
+
         /// Instance IDs (if omitted, interactive selection)
         #[arg(value_name = "INSTANCE_ID")]
         instance_ids: Vec<String>,
@@ -44,6 +88,9 @@ enum Commands {
 
     /// Restart (stop+start) one or more EC2 instances
     Restart {
+        #[command(flatten)]
+        profile: ProfileArgs,
+
         /// Instance IDs (if omitted, interactive selection)
         #[arg(value_name = "INSTANCE_ID")]
         instance_ids: Vec<String>,
@@ -51,6 +98,9 @@ enum Commands {
 
     /// Wait for instances to stop
     Wait {
+        #[command(flatten)]
+        profile: ProfileArgs,
+
         /// Instance IDs (if omitted, interactive selection)
         #[arg(value_name = "INSTANCE_ID")]
         instance_ids: Vec<String>,
@@ -58,6 +108,9 @@ enum Commands {
 
     /// Change instance type
     ChangeType {
+        #[command(flatten)]
+        profile: ProfileArgs,
+
         /// New instance type (e.g. t3.large)
         #[arg(value_name = "INSTANCE_TYPE")]
         instance_type: String,
@@ -69,6 +122,9 @@ enum Commands {
 
     /// Terminate an instance (requires confirmation)
     Terminate {
+        #[command(flatten)]
+        profile: ProfileArgs,
+
         /// Instance IDs (if omitted, interactive selection)
         #[arg(value_name = "INSTANCE_ID")]
         instance_ids: Vec<String>,
@@ -412,18 +468,39 @@ async fn describe_instances_by_ids(client: &Client, instance_ids: &[String]) -> 
 async fn main() {
     let cli = Cli::parse();
 
-    let client = get_client(&cli.profile).await;
+    let profile = match &cli.command {
+        Commands::List { profile, .. } => &profile.profile,
+        Commands::Start { profile, .. } => &profile.profile,
+        Commands::Stop { profile, .. } => &profile.profile,
+        Commands::Restart { profile, .. } => &profile.profile,
+        Commands::Wait { profile, .. } => &profile.profile,
+        Commands::ChangeType { profile, .. } => &profile.profile,
+        Commands::Terminate { profile, .. } => &profile.profile,
+    };
+
+    let client = get_client(profile).await;
 
     match cli.command {
-        Commands::List { state } => cmd_list(&client, state).await,
-        Commands::Start { instance_ids } => cmd_start(&client, instance_ids).await,
-        Commands::Stop { instance_ids } => cmd_stop(&client, instance_ids).await,
-        Commands::Restart { instance_ids } => cmd_restart(&client, instance_ids).await,
-        Commands::Wait { instance_ids } => cmd_wait(&client, instance_ids).await,
+        Commands::List { ref state, .. } => {
+            if should_use_pager(&cli) {
+                run_with_pager(|| pipe_to_pager());
+            }
+            cmd_list(&client, state.clone()).await;
+        }
+        Commands::Start { instance_ids, .. } => cmd_start(&client, instance_ids).await,
+        Commands::Stop { instance_ids, .. } => cmd_stop(&client, instance_ids).await,
+        Commands::Restart { instance_ids, .. } => cmd_restart(&client, instance_ids).await,
+        Commands::Wait { instance_ids, .. } => cmd_wait(&client, instance_ids).await,
         Commands::ChangeType {
             instance_type,
             instance_ids,
+            ..
         } => cmd_change_type(&client, instance_type, instance_ids).await,
-        Commands::Terminate { instance_ids } => cmd_terminate(&client, instance_ids).await,
+        Commands::Terminate { ref instance_ids, .. } => {
+            if should_use_pager(&cli) {
+                run_with_pager(|| pipe_to_pager());
+            }
+            cmd_terminate(&client, instance_ids.clone()).await;
+        }
     }
 }
