@@ -9,6 +9,50 @@ use tabled::{Table, Tabled};
 use aws_sdk_ec2::client::Waiters;
 use aws_smithy_async::rt::sleep::default_async_sleep;
 
+// ANSI color codes
+const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+const DIM: &str = "\x1b[2m";
+
+// State colors
+const GREEN: &str = "\x1b[32m";      // Success/running
+const YELLOW: &str = "\x1b[33m";     // Warning/stopping/waiting
+const RED: &str = "\x1b[31m";        // Error/stopped/terminate
+const CYAN: &str = "\x1b[36m";       // Info
+const BLUE: &str = "\x1b[34m";       // Neutral
+
+// State-specific colors
+const STATE_RUNNING: &str = "\x1b[32m";    // Bright green
+const STATE_STOPPED: &str = "\x1b[33m";    // Yellow
+const STATE_STOPPING: &str = "\x1b[33m";   // Yellow (dim)
+const STATE_PENDING: &str = "\x1b[36m";    // Cyan
+const STATE_SHUTTING_DOWN: &str = "\x1b[31m"; // Red
+const STATE_TERMINATED: &str = "\x1b[90m";  // Gray
+
+fn state_color(state: &str) -> &'static str {
+    match state.to_lowercase().as_str() {
+        "running" => STATE_RUNNING,
+        "pending" => STATE_PENDING,
+        "stopping" => STATE_STOPPING,
+        "stopped" => STATE_STOPPED,
+        "shutting-down" => STATE_SHUTTING_DOWN,
+        "terminated" => STATE_TERMINATED,
+        _ => RESET,
+    }
+}
+
+fn state_emoji(state: &str) -> &str {
+    match state.to_lowercase().as_str() {
+        "running" => "🟢",
+        "pending" => "🔵",
+        "stopping" => "🟡",
+        "stopped" => "⭕",
+        "shutting-down" => "🔴",
+        "terminated" => "⚫",
+        _ => "⚪",
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "ec2", about = "EC2 instance management CLI", version)]
 struct Cli {
@@ -242,13 +286,33 @@ async fn cmd_list(client: &Client, states: Option<String>) -> Vec<u8> {
     let instances = describe_instances(client, &states_vec).await;
 
     if instances.is_empty() {
-        let msg = format!("\x1b[31mNo instances found.\x1b[0m\n");
+        let msg = format!("{}🔍 No instances found.{}\n", RED, RESET);
         return msg.into_bytes();
     }
 
-    let table = Table::new(&instances);
-    let output = format!("\n{}", table.to_string());
-    output.into_bytes()
+    let mut output = Vec::new();
+    output.extend_from_slice(&format!("\n{}{}{} ({} instance{}){}\n", BOLD, CYAN, "EC2 Instances", instances.len(), if instances.len() == 1 {""} else {"s"}, RESET).into_bytes());
+    
+    // Build a colorized table output
+    for inst in &instances {
+        let state_colored = format!("{}{}{}", state_color(&inst.state), inst.state, RESET);
+        let name_colored = if inst.name != "-" {
+            format!("{}{}{}", BOLD, inst.name, RESET)
+        } else {
+            format!("{}{}{}", DIM, inst.name, RESET)
+        };
+        
+        output.extend_from_slice(&format!(
+            "  {} {} | {} | {} | {}\n",
+            state_emoji(&inst.state),
+            name_colored,
+            inst.instance_type,
+            state_colored,
+            inst.private_ip
+        ).into_bytes());
+    }
+    
+    output
 }
 
 async fn cmd_start(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
@@ -265,7 +329,7 @@ async fn cmd_start(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
         .unwrap();
 
     let mut output = Vec::new();
-    output.extend_from_slice(b"\x1b[32mWaiting for instances to start...\x1b[0m\n");
+    output.extend_from_slice(&format!("{}⏳ Waiting for instances to start...{}\n", YELLOW, RESET).into_bytes());
 
     client
         .wait_until_instance_running()
@@ -274,7 +338,7 @@ async fn cmd_start(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
         .await
         .unwrap();
 
-    output.extend_from_slice(&format!("\x1b[32mInstance(s) {} are running\x1b[0m\n", ids.join(", ")).into_bytes());
+    output.extend_from_slice(&format!("{}✅ Instance(s) {} are now running{}\n", GREEN, ids.join(", "), RESET).into_bytes());
     output
 }
 
@@ -291,7 +355,7 @@ async fn cmd_stop(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
         .await
         .unwrap();
 
-    format!("\x1b[33mInstance(s) {} stopped\x1b[0m\n", ids.join(", ")).into_bytes()
+    format!("{}⏹️ Instance(s) {} stopped{}\n", YELLOW, ids.join(", "), RESET).into_bytes()
 }
 
 async fn cmd_restart(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
@@ -301,7 +365,7 @@ async fn cmd_restart(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
     }
 
     let mut output = Vec::new();
-    output.extend_from_slice(b"\x1b[33mStopping instances...\x1b[0m\n");
+    output.extend_from_slice(&format!("{}⏹️ Stopping instances...{}\n", YELLOW, RESET).into_bytes());
 
     client
         .stop_instances()
@@ -317,7 +381,7 @@ async fn cmd_restart(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
         .await
         .unwrap();
 
-    output.extend_from_slice(b"\x1b[33mStarting instances...\x1b[0m\n");
+    output.extend_from_slice(&format!("{}▶️ Starting instances...{}\n", YELLOW, RESET).into_bytes());
 
     client
         .start_instances()
@@ -333,7 +397,7 @@ async fn cmd_restart(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
         .await
         .unwrap();
 
-    output.extend_from_slice(&format!("\x1b[32mInstance(s) {} restarted successfully\x1b[0m\n", ids.join(", ")).into_bytes());
+    output.extend_from_slice(&format!("{}✅ Instance(s) {} restarted successfully{}\n", GREEN, ids.join(", "), RESET).into_bytes());
     output
 }
 
@@ -344,7 +408,7 @@ async fn cmd_wait(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
     }
 
     let mut output = Vec::new();
-    output.extend_from_slice(b"\x1b[33mWaiting for instances to stop...\x1b[0m\n");
+    output.extend_from_slice(&format!("{}⏳ Waiting for instances to stop...{}\n", YELLOW, RESET).into_bytes());
 
     client
         .wait_until_instance_stopped()
@@ -353,7 +417,7 @@ async fn cmd_wait(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
         .await
         .unwrap();
 
-    output.extend_from_slice(&format!("\x1b[32mInstance(s) {} are stopped\x1b[0m\n", ids.join(", ")).into_bytes());
+    output.extend_from_slice(&format!("{}✅ Instance(s) {} are now stopped{}\n", GREEN, ids.join(", "), RESET).into_bytes());
     output
 }
 
@@ -365,7 +429,7 @@ async fn cmd_change_type(client: &Client, instance_type: String, instance_ids: V
 
     let mut output = Vec::new();
     for id in &ids {
-        output.extend_from_slice(&format!("\x1b[33mChanging {} to {}...\x1b[0m\n", id, instance_type).into_bytes());
+        output.extend_from_slice(&format!("{}🔄 Changing {} to {}...{}\n", YELLOW, id, instance_type, RESET).into_bytes());
 
         client
             .modify_instance_attribute()
@@ -377,7 +441,7 @@ async fn cmd_change_type(client: &Client, instance_type: String, instance_ids: V
             .await
             .unwrap();
 
-        output.extend_from_slice(&format!("\x1b[32mInstance {} type changed\x1b[0m\n", id).into_bytes());
+        output.extend_from_slice(&format!("{}✅ Instance {} type changed to {}{}\n", GREEN, id, instance_type, RESET).into_bytes());
     }
     output
 }
@@ -390,10 +454,10 @@ async fn cmd_terminate(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
 
     let instances = describe_instances_by_ids(client, &ids).await;
     let table = Table::new(&instances);
-    let mut output = format!("\n{}", table.to_string()).into_bytes();
+    let mut output = format!("\n{}🗑️ Instances to terminate:{}\n{}", RED, RESET, table.to_string()).into_bytes();
 
-    output.extend_from_slice(b"\x1b[31mWARNING: Termination permanently deletes the instance!\x1b[0m\n");
-    output.extend_from_slice(b"Type \"terminate\" to confirm: ");
+    output.extend_from_slice(&format!("\n{}⚠️  WARNING: Termination permanently deletes the instance!{}\n", RED, RESET).into_bytes());
+    output.extend_from_slice(&format!("{}Type \"terminate\" to confirm:{}\n", YELLOW, RESET).into_bytes());
     std::io::stdout().flush().unwrap();
 
     let mut confirmation = String::new();
@@ -401,7 +465,7 @@ async fn cmd_terminate(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
 
     if confirmation.trim() != "terminate" {
         output.clear();
-        output.extend_from_slice(b"\x1b[33mTermination cancelled.\x1b[0m\n");
+        output.extend_from_slice(&format!("{}❌ Termination cancelled.{}\n", YELLOW, RESET).into_bytes());
         return output;
     }
 
@@ -412,7 +476,8 @@ async fn cmd_terminate(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
         .await
         .unwrap();
 
-    output.extend_from_slice(&format!("\x1b[32mInstance(s) {} terminated\x1b[0m\n", ids.join(", ")).into_bytes());
+    output.clear();
+    output.extend_from_slice(&format!("{}✅ Instance(s) {} terminated successfully{}\n", GREEN, ids.join(", "), RESET).into_bytes());
     output
 }
 
@@ -427,15 +492,16 @@ async fn resolve_instance_ids(client: &Client, provided_ids: &[String]) -> Vec<S
         return Vec::new();
     }
 
-    println!("\nAvailable instances:");
+    println!("\n{}🔍 Available instances:{}", CYAN, RESET);
     for (i, inst) in instances.iter().enumerate() {
+        let state_colored = format!("{}{}{}", state_color(&inst.state), inst.state, RESET);
         println!(
             "  {}. {} | {} | {} | {}",
             i + 1,
             inst.instance_id,
             inst.name,
             inst.instance_type,
-            inst.state
+            state_colored
         );
     }
 
