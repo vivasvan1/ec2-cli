@@ -1,5 +1,5 @@
 use std::io::{Write, IsTerminal};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use aws_sdk_ec2::types::{Filter, Instance, Tag};
 use aws_sdk_ec2::Client;
@@ -18,33 +18,6 @@ struct Cli {
 
     #[command(subcommand)]
     command: Commands,
-}
-
-fn should_use_pager(cli: &Cli) -> bool {
-    match cli.pager {
-        Some(v) => v,
-        None => std::io::stdout().is_terminal(),
-    }
-}
-
-fn pipe_to_pager() -> std::process::Child {
-    Command::new("less")
-        .arg("-R") // pass through ANSI color codes
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .spawn()
-        .expect("Failed to spawn less")
-}
-
-fn run_with_pager<F>(f: F) 
-where
-    F: FnOnce() -> std::process::Child,
-{
-    let mut child = f();
-    let status = child.wait().expect("Failed to wait for pager");
-    if !status.success() {
-        eprintln!("pager exited with status: {}", status);
-    }
 }
 
 #[derive(Parser, Clone)]
@@ -236,7 +209,32 @@ async fn interactive_select(instances: &[InstanceInfo]) -> Option<usize> {
     }
 }
 
-async fn cmd_list(client: &Client, states: Option<String>) {
+fn should_use_pager(cli: &Cli) -> bool {
+    match cli.pager {
+        Some(v) => v,
+        None => std::io::stdout().is_terminal(),
+    }
+}
+
+fn run_with_pager(output: Vec<u8>) {
+    let mut child = Command::new("less")
+        .arg("-R") // pass through ANSI color codes
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .spawn()
+        .expect("Failed to spawn less");
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(&output).expect("Failed to write to pager");
+    }
+
+    let status = child.wait().expect("Failed to wait for pager");
+    if !status.success() {
+        eprintln!("pager exited with status: {}", status);
+    }
+}
+
+async fn cmd_list(client: &Client, states: Option<String>) -> Vec<u8> {
     let states_vec: Vec<String> = states
         .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
         .unwrap_or_default();
@@ -244,18 +242,19 @@ async fn cmd_list(client: &Client, states: Option<String>) {
     let instances = describe_instances(client, &states_vec).await;
 
     if instances.is_empty() {
-        color_print::cprintln!("<red>No instances found.</red>");
-        return;
+        let msg = format!("\x1b[31mNo instances found.\x1b[0m\n");
+        return msg.into_bytes();
     }
 
     let table = Table::new(&instances);
-    println!("\n{}", table.to_string());
+    let output = format!("\n{}", table.to_string());
+    output.into_bytes()
 }
 
-async fn cmd_start(client: &Client, instance_ids: Vec<String>) {
+async fn cmd_start(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
     let ids = resolve_instance_ids(client, &instance_ids).await;
     if ids.is_empty() {
-        return;
+        return Vec::new();
     }
 
     client
@@ -265,7 +264,8 @@ async fn cmd_start(client: &Client, instance_ids: Vec<String>) {
         .await
         .unwrap();
 
-    color_print::cprintln!("<green>Waiting for instances to start...</green>");
+    let mut output = Vec::new();
+    output.extend_from_slice(b"\x1b[32mWaiting for instances to start...\x1b[0m\n");
 
     client
         .wait_until_instance_running()
@@ -274,13 +274,14 @@ async fn cmd_start(client: &Client, instance_ids: Vec<String>) {
         .await
         .unwrap();
 
-    color_print::cprintln!("<green>Instance(s) {} are running</green>", ids.join(", "));
+    output.extend_from_slice(&format!("\x1b[32mInstance(s) {} are running\x1b[0m\n", ids.join(", ")).into_bytes());
+    output
 }
 
-async fn cmd_stop(client: &Client, instance_ids: Vec<String>) {
+async fn cmd_stop(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
     let ids = resolve_instance_ids(client, &instance_ids).await;
     if ids.is_empty() {
-        return;
+        return Vec::new();
     }
 
     client
@@ -290,16 +291,17 @@ async fn cmd_stop(client: &Client, instance_ids: Vec<String>) {
         .await
         .unwrap();
 
-    color_print::cprintln!("<yellow>Instance(s) {} stopped</yellow>", ids.join(", "));
+    format!("\x1b[33mInstance(s) {} stopped\x1b[0m\n", ids.join(", ")).into_bytes()
 }
 
-async fn cmd_restart(client: &Client, instance_ids: Vec<String>) {
+async fn cmd_restart(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
     let ids = resolve_instance_ids(client, &instance_ids).await;
     if ids.is_empty() {
-        return;
+        return Vec::new();
     }
 
-    color_print::cprintln!("<yellow>Stopping instances...</yellow>");
+    let mut output = Vec::new();
+    output.extend_from_slice(b"\x1b[33mStopping instances...\x1b[0m\n");
 
     client
         .stop_instances()
@@ -315,7 +317,7 @@ async fn cmd_restart(client: &Client, instance_ids: Vec<String>) {
         .await
         .unwrap();
 
-    color_print::cprintln!("<yellow>Starting instances...</yellow>");
+    output.extend_from_slice(b"\x1b[33mStarting instances...\x1b[0m\n");
 
     client
         .start_instances()
@@ -331,16 +333,18 @@ async fn cmd_restart(client: &Client, instance_ids: Vec<String>) {
         .await
         .unwrap();
 
-    color_print::cprintln!("<green>Instance(s) {} restarted successfully</green>", ids.join(", "));
+    output.extend_from_slice(&format!("\x1b[32mInstance(s) {} restarted successfully\x1b[0m\n", ids.join(", ")).into_bytes());
+    output
 }
 
-async fn cmd_wait(client: &Client, instance_ids: Vec<String>) {
+async fn cmd_wait(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
     let ids = resolve_instance_ids(client, &instance_ids).await;
     if ids.is_empty() {
-        return;
+        return Vec::new();
     }
 
-    color_print::cprintln!("<yellow>Waiting for instances to stop...</yellow>");
+    let mut output = Vec::new();
+    output.extend_from_slice(b"\x1b[33mWaiting for instances to stop...\x1b[0m\n");
 
     client
         .wait_until_instance_stopped()
@@ -349,17 +353,19 @@ async fn cmd_wait(client: &Client, instance_ids: Vec<String>) {
         .await
         .unwrap();
 
-    color_print::cprintln!("<green>Instance(s) {} are stopped</green>", ids.join(", "));
+    output.extend_from_slice(&format!("\x1b[32mInstance(s) {} are stopped\x1b[0m\n", ids.join(", ")).into_bytes());
+    output
 }
 
-async fn cmd_change_type(client: &Client, instance_type: String, instance_ids: Vec<String>) {
+async fn cmd_change_type(client: &Client, instance_type: String, instance_ids: Vec<String>) -> Vec<u8> {
     let ids = resolve_instance_ids(client, &instance_ids).await;
     if ids.is_empty() {
-        return;
+        return Vec::new();
     }
 
+    let mut output = Vec::new();
     for id in &ids {
-        color_print::cprintln!("<yellow>Changing {} to {}...</yellow>", id, instance_type);
+        output.extend_from_slice(&format!("\x1b[33mChanging {} to {}...\x1b[0m\n", id, instance_type).into_bytes());
 
         client
             .modify_instance_attribute()
@@ -371,30 +377,32 @@ async fn cmd_change_type(client: &Client, instance_type: String, instance_ids: V
             .await
             .unwrap();
 
-        color_print::cprintln!("<green>Instance {} type changed</green>", id);
+        output.extend_from_slice(&format!("\x1b[32mInstance {} type changed\x1b[0m\n", id).into_bytes());
     }
+    output
 }
 
-async fn cmd_terminate(client: &Client, instance_ids: Vec<String>) {
+async fn cmd_terminate(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
     let ids = resolve_instance_ids(client, &instance_ids).await;
     if ids.is_empty() {
-        return;
+        return Vec::new();
     }
 
     let instances = describe_instances_by_ids(client, &ids).await;
     let table = Table::new(&instances);
-    println!("\n{}", table.to_string());
+    let mut output = format!("\n{}", table.to_string()).into_bytes();
 
-    color_print::cprintln!("<red>WARNING: Termination permanently deletes the instance!</red>");
-    print!("Type \"terminate\" to confirm: ");
+    output.extend_from_slice(b"\x1b[31mWARNING: Termination permanently deletes the instance!\x1b[0m\n");
+    output.extend_from_slice(b"Type \"terminate\" to confirm: ");
     std::io::stdout().flush().unwrap();
 
     let mut confirmation = String::new();
     std::io::stdin().read_line(&mut confirmation).unwrap();
 
     if confirmation.trim() != "terminate" {
-        color_print::cprintln!("<yellow>Termination cancelled.</yellow>");
-        return;
+        output.clear();
+        output.extend_from_slice(b"\x1b[33mTermination cancelled.\x1b[0m\n");
+        return output;
     }
 
     client
@@ -404,7 +412,8 @@ async fn cmd_terminate(client: &Client, instance_ids: Vec<String>) {
         .await
         .unwrap();
 
-    color_print::cprintln!("<green>Instance(s) {} terminated</green>", ids.join(", "));
+    output.extend_from_slice(&format!("\x1b[32mInstance(s) {} terminated\x1b[0m\n", ids.join(", ")).into_bytes());
+    output
 }
 
 async fn resolve_instance_ids(client: &Client, provided_ids: &[String]) -> Vec<String> {
@@ -415,7 +424,6 @@ async fn resolve_instance_ids(client: &Client, provided_ids: &[String]) -> Vec<S
     let instances = describe_instances(client, &[]).await;
 
     if instances.is_empty() {
-        color_print::cprintln!("<red>No selectable EC2 instances found.</red>");
         return Vec::new();
     }
 
@@ -433,10 +441,7 @@ async fn resolve_instance_ids(client: &Client, provided_ids: &[String]) -> Vec<S
 
     match interactive_select(&instances).await {
         Some(idx) => vec![instances[idx].instance_id.clone()],
-        None => {
-            color_print::cprintln!("<yellow>No instance selected.</yellow>");
-            Vec::new()
-        }
+        None => Vec::new(),
     }
 }
 
@@ -480,27 +485,48 @@ async fn main() {
 
     let client = get_client(profile).await;
 
+    let use_pager = should_use_pager(&cli);
+
     match cli.command {
-        Commands::List { ref state, .. } => {
-            if should_use_pager(&cli) {
-                run_with_pager(|| pipe_to_pager());
+        Commands::List { state, .. } => {
+            let output = cmd_list(&client, state).await;
+            if use_pager {
+                run_with_pager(output);
+            } else {
+                print!("{}", String::from_utf8_lossy(&output));
             }
-            cmd_list(&client, state.clone()).await;
         }
-        Commands::Start { instance_ids, .. } => cmd_start(&client, instance_ids).await,
-        Commands::Stop { instance_ids, .. } => cmd_stop(&client, instance_ids).await,
-        Commands::Restart { instance_ids, .. } => cmd_restart(&client, instance_ids).await,
-        Commands::Wait { instance_ids, .. } => cmd_wait(&client, instance_ids).await,
+        Commands::Start { instance_ids, .. } => {
+            let output = cmd_start(&client, instance_ids).await;
+            print!("{}", String::from_utf8_lossy(&output));
+        }
+        Commands::Stop { instance_ids, .. } => {
+            let output = cmd_stop(&client, instance_ids).await;
+            print!("{}", String::from_utf8_lossy(&output));
+        }
+        Commands::Restart { instance_ids, .. } => {
+            let output = cmd_restart(&client, instance_ids).await;
+            print!("{}", String::from_utf8_lossy(&output));
+        }
+        Commands::Wait { instance_ids, .. } => {
+            let output = cmd_wait(&client, instance_ids).await;
+            print!("{}", String::from_utf8_lossy(&output));
+        }
         Commands::ChangeType {
             instance_type,
             instance_ids,
             ..
-        } => cmd_change_type(&client, instance_type, instance_ids).await,
-        Commands::Terminate { ref instance_ids, .. } => {
-            if should_use_pager(&cli) {
-                run_with_pager(|| pipe_to_pager());
+        } => {
+            let output = cmd_change_type(&client, instance_type, instance_ids).await;
+            print!("{}", String::from_utf8_lossy(&output));
+        }
+        Commands::Terminate { instance_ids, .. } => {
+            let output = cmd_terminate(&client, instance_ids).await;
+            if use_pager {
+                run_with_pager(output);
+            } else {
+                print!("{}", String::from_utf8_lossy(&output));
             }
-            cmd_terminate(&client, instance_ids.clone()).await;
         }
     }
 }
