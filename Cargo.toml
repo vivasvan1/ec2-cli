@@ -1,0 +1,13 @@
+[package]
+name = "ec2-cli"
+version = "0.1.0"
+edition = "2021"
+description = "A CLI tool for managing AWS EC2 instances"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+aws-sdk-ec2 = { version = "1.255", default-features = false, features = ["rustls"] }
+aws-config = { version = "1.5", default-features = false, features = ["rustls"] }
+tokio = { version = "1", features = ["full"] }
+tabled = "0.17"
+color-print = "0.3"
