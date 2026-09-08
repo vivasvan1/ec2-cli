@@ -1,5 +1,4 @@
-use std::io::{Write, IsTerminal};
-use std::process::{Command, Stdio};
+use std::io::Write;
 
 use aws_sdk_ec2::types::{Filter, Instance, Tag};
 use aws_sdk_ec2::Client;
@@ -56,10 +55,6 @@ fn state_emoji(state: &str) -> &str {
 #[derive(Parser)]
 #[command(name = "ec2", about = "EC2 instance management CLI", version)]
 struct Cli {
-    /// Use less pager for output (default: auto when stdout is a terminal)
-    #[arg(long)]
-    pager: Option<bool>,
-
     #[command(subcommand)]
     command: Commands,
 }
@@ -205,15 +200,17 @@ fn extract_state(instance: &Instance) -> String {
 
 async fn describe_instances(client: &Client, states: &[String]) -> Vec<InstanceInfo> {
     let mut filter_builder = Filter::builder().name("instance-state-name");
-    if states.is_empty() {
-        for s in ["pending", "running", "stopping", "stopped"] {
-            filter_builder = filter_builder.values(s.to_string());
-        }
+    
+    let states_to_filter: Vec<String> = if states.is_empty() {
+        ["pending", "running", "stopping", "stopped"].iter().map(|s| s.to_string()).collect()
     } else {
-        for s in states {
-            filter_builder = filter_builder.values(s.clone());
-        }
+        states.to_vec()
+    };
+    
+    for s in states_to_filter {
+        filter_builder = filter_builder.values(s);
     }
+    
     let filter = filter_builder.build();
 
     let resp = client
@@ -253,30 +250,7 @@ async fn interactive_select(instances: &[InstanceInfo]) -> Option<usize> {
     }
 }
 
-fn should_use_pager(cli: &Cli) -> bool {
-    match cli.pager {
-        Some(v) => v,
-        None => std::io::stdout().is_terminal(),
-    }
-}
 
-fn run_with_pager(output: Vec<u8>) {
-    let mut child = Command::new("less")
-        .arg("-R") // pass through ANSI color codes
-        .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .spawn()
-        .expect("Failed to spawn less");
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(&output).expect("Failed to write to pager");
-    }
-
-    let status = child.wait().expect("Failed to wait for pager");
-    if !status.success() {
-        eprintln!("pager exited with status: {}", status);
-    }
-}
 
 async fn cmd_list(client: &Client, states: Option<String>) -> Vec<u8> {
     let states_vec: Vec<String> = states
@@ -566,16 +540,10 @@ async fn main() {
 
     let client = get_client(profile).await;
 
-    let use_pager = should_use_pager(&cli);
-
     match cli.command {
         Commands::List { state, .. } => {
             let output = cmd_list(&client, state).await;
-            if use_pager {
-                run_with_pager(output);
-            } else {
-                print!("{}", String::from_utf8_lossy(&output));
-            }
+            print!("{}", String::from_utf8_lossy(&output));
         }
         Commands::Start { instance_ids, .. } => {
             let output = cmd_start(&client, instance_ids).await;
@@ -603,11 +571,7 @@ async fn main() {
         }
         Commands::Terminate { instance_ids, .. } => {
             let output = cmd_terminate(&client, instance_ids).await;
-            if use_pager {
-                run_with_pager(output);
-            } else {
-                print!("{}", String::from_utf8_lossy(&output));
-            }
+            print!("{}", String::from_utf8_lossy(&output));
         }
     }
 }
