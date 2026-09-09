@@ -3,7 +3,7 @@ use std::io::Write;
 use aws_sdk_ec2::types::{Filter, Instance, Tag};
 use aws_sdk_ec2::Client;
 use clap::{Parser, Subcommand};
-use tabled::{Table, Tabled};
+use tabled::{Table, Tabled, settings::{Style, Width}};
 
 use aws_sdk_ec2::client::Waiters;
 use aws_smithy_async::rt::sleep::default_async_sleep;
@@ -268,25 +268,21 @@ async fn cmd_list(client: &Client, states: Option<String>) -> Vec<u8> {
         return format!("\n{}🔍 No instances found.{}\n", RED, RESET).into_bytes();
     }
 
+    // Build colorized rows with fixed widths
     let mut output = Vec::new();
     
-    // Header
-    output.extend_from_slice(&format!("\n{}🖥️  EC2 Instances{}\n", BOLD, RESET).into_bytes());
-    output.extend_from_slice(&format!("{}   {} {} instances{}\n", GRAY, instances.len(), if instances.len() == 1 {"instance"} else {"instances"}, RESET).into_bytes());
-    output.extend_from_slice(b"\n");
+    output.extend_from_slice(&format!("\n{}🖥️  EC2 Instances{}\n\n", BOLD, RESET).into_bytes());
+    output.extend_from_slice(&format!("{}{} instance(s)\n\n", GRAY, instances.len()).into_bytes());
     
-    // Table header
-    output.extend_from_slice(&format!(
-        "   {} | {} | {} | {} | {}\n",
-        format!("{}📛 ID{}", BOLD, RESET),
-        format!("{}🏷️ Name{}", BOLD, RESET),
-        format!("{}💻 Type{}", BOLD, RESET),
-        format!("{}📊 State{}", BOLD, RESET),
-        format!("{}🌐 IP{}", BOLD, RESET)
-    ).into_bytes());
+    // Header with fixed widths
+    let header = format!(
+        "   {:<20} | {:<20} | {:<15} | {:<15} | {:<18}\n",
+        "📛 ID", "🏷️ Name", "💻 Type", "📊 State", "🌐 IP"
+    );
+    output.extend_from_slice(&header.into_bytes());
     
     // Separator
-    output.extend_from_slice(b"   ---|------|------|------|------\n");
+    output.extend_from_slice(b"   --------------------|--------------------|---------------|---------------|------------------\n");
     
     // Table rows
     for inst in &instances {
@@ -297,14 +293,15 @@ async fn cmd_list(client: &Client, states: Option<String>) -> Vec<u8> {
             format!("{}{}{}", DIM, inst.name, RESET)
         };
         
-        output.extend_from_slice(&format!(
-            "   {} | {} | {} | {} | {}\n",
+        let line = format!(
+            "   {:<20} | {:<20} | {:<15} | {:<15} | {:<18}\n",
             inst.instance_id,
             name_colored,
             inst.instance_type,
             state_colored,
             inst.private_ip
-        ).into_bytes());
+        );
+        output.extend_from_slice(&line.into_bytes());
     }
     
     output.extend_from_slice(b"\n");
