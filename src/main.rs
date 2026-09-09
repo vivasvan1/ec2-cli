@@ -1,62 +1,41 @@
 use std::io::Write;
+use std::process::Command;
 
 use aws_sdk_ec2::types::{Filter, Instance, Tag};
 use aws_sdk_ec2::Client;
 use clap::{Parser, Subcommand};
-use tabled::{Table, Tabled, settings::{Style, Width}};
+use comfy_table::{Table, Cell, CellAlignment, ContentArrangement, TableStyle, LineStyle, ContentLineStyle};
+use serde::Serialize;
 
 use aws_sdk_ec2::client::Waiters;
 use aws_smithy_async::rt::sleep::default_async_sleep;
 
-// ANSI color codes
-const RESET: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const ITALIC: &str = "\x1b[3m";
+// ─── Output format enum ────────────────────────────────────────────────
+#[derive(clap::ValueEnum, Clone, Default, Debug)]
+enum OutputFormat {
+    /// Pretty table (default)
+    #[default]
+    Table,
+    /// Pipe through less pager
+    Less,
+    /// JSON output
+    Json,
+}
 
-// Colors
-const GREEN: &str = "\x1b[32m";
-const YELLOW: &str = "\x1b[33m";
-const RED: &str = "\x1b[31m";
-const CYAN: &str = "\x1b[36m";
-const BLUE: &str = "\x1b[34m";
-const MAGENTA: &str = "\x1b[35m";
-const WHITE: &str = "\x1b[37m";
-const GRAY: &str = "\x1b[90m";
-const LIGHT_GRAY: &str = "\x1b[37m";
-
-// State colors
-const STATE_RUNNING: &str = "\x1b[92m";    // Bright green
-const STATE_STOPPED: &str = "\x1b[91m";    // Bright red
-const STATE_STOPPING: &str = "\x1b[93m";   // Bright yellow
-const STATE_PENDING: &str = "\x1b[96m";    // Bright cyan
-const STATE_SHUTTING_DOWN: &str = "\x1b[91m"; // Bright red
-const STATE_TERMINATED: &str = GRAY;
-
-fn state_color(state: &str) -> &'static str {
+// ─── State emoji mapping ───────────────────────────────────────────────
+fn state_emoji(state: &str) -> &'static str {
     match state.to_lowercase().as_str() {
-        "running" => STATE_RUNNING,
-        "pending" => STATE_PENDING,
-        "stopping" => STATE_STOPPING,
-        "stopped" => STATE_STOPPED,
-        "shutting-down" => STATE_SHUTTING_DOWN,
-        "terminated" => STATE_TERMINATED,
-        _ => GRAY,
+        "running" => "\u{1F7E2}",  // 🟢
+        "pending" => "\u{1F535}",  // 🔵
+        "stopping" => "\u{1F7E1}", // 🟡
+        "stopped" => "\u{1F534}",  // 🔴
+        "shutting-down" => "\u{1F7E0}", // 🟠
+        "terminated" => "\u{1F534}", // ⚫
+        _ => "\u{26AA}",           // ⚪
     }
 }
 
-fn state_emoji(state: &str) -> &str {
-    match state.to_lowercase().as_str() {
-        "running" => "🟢",
-        "pending" => "🔵",
-        "stopping" => "🟡",
-        "stopped" => "🔴",
-        "shutting-down" => "💥",
-        "terminated" => "⚫",
-        _ => "⚪",
-    }
-}
-
+// ─── CLI structs ───────────────────────────────────────────────────────
 #[derive(Parser)]
 #[command(name = "ec2", about = "EC2 instance management CLI", version)]
 struct Cli {
@@ -81,6 +60,10 @@ enum Commands {
         /// Filter by instance state (comma-separated, e.g. running,stopped)
         #[arg(short, long)]
         state: Option<String>,
+
+        /// Output format: table (pretty), less (paged), json
+        #[arg(short, long, value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// Start one or more EC2 instances
@@ -145,27 +128,24 @@ enum Commands {
         /// Instance IDs (if omitted, interactive selection)
         #[arg(value_name = "INSTANCE_ID")]
         instance_ids: Vec<String>,
+
+        /// Output format: table (pretty), less (paged), json
+        #[arg(short, long, value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 }
 
-#[derive(Tabled)]
+// ─── Instance data ─────────────────────────────────────────────────────
+#[derive(Debug, Serialize)]
 struct InstanceInfo {
-    #[tabled(rename = "ID")]
     instance_id: String,
-
-    #[tabled(rename = "Name")]
     name: String,
-
-    #[tabled(rename = "Type")]
     instance_type: String,
-
-    #[tabled(rename = "State")]
     state: String,
-
-    #[tabled(rename = "Private IP")]
     private_ip: String,
 }
 
+// ─── AWS helpers ───────────────────────────────────────────────────────
 fn set_profile(profile: &str) {
     std::env::set_var("AWS_PROFILE", profile);
 }
@@ -174,7 +154,6 @@ async fn get_client(profile: &str) -> Client {
     set_profile(profile);
     let config = aws_config::load_from_env().await;
 
-    // Set the async sleep implementation required by the retry system
     let config = config
         .to_builder()
         .sleep_impl(default_async_sleep().unwrap())
@@ -205,17 +184,20 @@ fn extract_state(instance: &Instance) -> String {
 
 async fn describe_instances(client: &Client, states: &[String]) -> Vec<InstanceInfo> {
     let mut filter_builder = Filter::builder().name("instance-state-name");
-    
+
     let states_to_filter: Vec<String> = if states.is_empty() {
-        ["pending", "running", "stopping", "stopped"].iter().map(|s| s.to_string()).collect()
+        ["pending", "running", "stopping", "stopped"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     } else {
         states.to_vec()
     };
-    
+
     for s in states_to_filter {
         filter_builder = filter_builder.values(s);
     }
-    
+
     let filter = filter_builder.build();
 
     let resp = client
@@ -241,280 +223,10 @@ async fn describe_instances(client: &Client, states: &[String]) -> Vec<InstanceI
     instances
 }
 
-async fn interactive_select(instances: &[InstanceInfo]) -> Option<usize> {
-    print!("Enter instance number (or 0 to cancel): ");
-    std::io::stdout().flush().unwrap();
-
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input).unwrap();
-    let num: usize = input.trim().parse().unwrap_or(0);
-    if num > 0 && num <= instances.len() {
-        Some(num - 1)
-    } else {
-        None
-    }
-}
-
-
-
-async fn cmd_list(client: &Client, states: Option<String>) -> Vec<u8> {
-    let states_vec: Vec<String> = states
-        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
-        .unwrap_or_default();
-
-    let instances = describe_instances(client, &states_vec).await;
-
-    if instances.is_empty() {
-        return format!("\n{}🔍 No instances found.{}\n", RED, RESET).into_bytes();
-    }
-
-    // Build colorized rows with fixed widths
-    let mut output = Vec::new();
-    
-    output.extend_from_slice(&format!("\n{}🖥️  EC2 Instances{}\n\n", BOLD, RESET).into_bytes());
-    output.extend_from_slice(&format!("{}{} instance(s)\n\n", GRAY, instances.len()).into_bytes());
-    
-    // Header with fixed widths
-    let header = format!(
-        "   {:<20} | {:<20} | {:<15} | {:<15} | {:<18}\n",
-        "📛 ID", "🏷️ Name", "💻 Type", "📊 State", "🌐 IP"
-    );
-    output.extend_from_slice(&header.into_bytes());
-    
-    // Separator
-    output.extend_from_slice(b"   --------------------|--------------------|---------------|---------------|------------------\n");
-    
-    // Table rows
-    for inst in &instances {
-        let state_colored = format!("{}{}{} {}", state_color(&inst.state), state_emoji(&inst.state), inst.state.to_uppercase(), RESET);
-        let name_colored = if inst.name != "-" {
-            format!("{}{}{}", BOLD, inst.name, RESET)
-        } else {
-            format!("{}{}{}", DIM, inst.name, RESET)
-        };
-        
-        let line = format!(
-            "   {:<20} | {:<20} | {:<15} | {:<15} | {:<18}\n",
-            inst.instance_id,
-            name_colored,
-            inst.instance_type,
-            state_colored,
-            inst.private_ip
-        );
-        output.extend_from_slice(&line.into_bytes());
-    }
-    
-    output.extend_from_slice(b"\n");
-    output
-}
-
-async fn cmd_start(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
-    let ids = resolve_instance_ids(client, &instance_ids).await;
-    if ids.is_empty() {
-        return Vec::new();
-    }
-
-    client
-        .start_instances()
-        .set_instance_ids(Some(ids.clone()))
-        .send()
-        .await
-        .unwrap();
-
-    let mut output = Vec::new();
-    output.extend_from_slice(&format!("\n{}▶️  Starting {} instance(s)...{}\n", CYAN, ids.len(), RESET).into_bytes());
-
-    client
-        .wait_until_instance_running()
-        .set_instance_ids(Some(ids.clone()))
-        .wait(std::time::Duration::from_secs(300))
-        .await
-        .unwrap();
-
-    output.extend_from_slice(&format!("{}✅ Instance(s) {} is now running{}\n", GREEN, ids.join(", "), RESET).into_bytes());
-    output
-}
-
-async fn cmd_stop(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
-    let ids = resolve_instance_ids(client, &instance_ids).await;
-    if ids.is_empty() {
-        return Vec::new();
-    }
-
-    client
-        .stop_instances()
-        .set_instance_ids(Some(ids.clone()))
-        .send()
-        .await
-        .unwrap();
-
-    format!("\n{}⏹️  Instance(s) {} stopped{}\n", YELLOW, ids.join(", "), RESET).into_bytes()
-}
-
-async fn cmd_restart(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
-    let ids = resolve_instance_ids(client, &instance_ids).await;
-    if ids.is_empty() {
-        return Vec::new();
-    }
-
-    let mut output = Vec::new();
-    output.extend_from_slice(&format!("\n{}⏹️  Stopping {} instance(s)...{}\n", YELLOW, ids.len(), RESET).into_bytes());
-
-    client
-        .stop_instances()
-        .set_instance_ids(Some(ids.clone()))
-        .send()
-        .await
-        .unwrap();
-
-    client
-        .wait_until_instance_stopped()
-        .set_instance_ids(Some(ids.clone()))
-        .wait(std::time::Duration::from_secs(300))
-        .await
-        .unwrap();
-
-    output.extend_from_slice(&format!("{}▶️ Starting {} instance(s)...{}\n", CYAN, ids.len(), RESET).into_bytes());
-
-    client
-        .start_instances()
-        .set_instance_ids(Some(ids.clone()))
-        .send()
-        .await
-        .unwrap();
-
-    client
-        .wait_until_instance_running()
-        .set_instance_ids(Some(ids.clone()))
-        .wait(std::time::Duration::from_secs(300))
-        .await
-        .unwrap();
-
-    output.extend_from_slice(&format!("{}✅ Instance(s) {} restarted successfully{}\n", GREEN, ids.join(", "), RESET).into_bytes());
-    output
-}
-
-async fn cmd_wait(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
-    let ids = resolve_instance_ids(client, &instance_ids).await;
-    if ids.is_empty() {
-        return Vec::new();
-    }
-
-    let mut output = Vec::new();
-    output.extend_from_slice(&format!("\n{}⏳ Waiting for {} instance(s) to stop...{}\n", YELLOW, ids.len(), RESET).into_bytes());
-
-    client
-        .wait_until_instance_stopped()
-        .set_instance_ids(Some(ids.clone()))
-        .wait(std::time::Duration::from_secs(300))
-        .await
-        .unwrap();
-
-    output.extend_from_slice(&format!("{}✅ Instance(s) {} are now stopped{}\n", GREEN, ids.join(", "), RESET).into_bytes());
-    output
-}
-
-async fn cmd_change_type(client: &Client, instance_type: String, instance_ids: Vec<String>) -> Vec<u8> {
-    let ids = resolve_instance_ids(client, &instance_ids).await;
-    if ids.is_empty() {
-        return Vec::new();
-    }
-
-    let mut output = Vec::new();
-    output.extend_from_slice(&format!("\n{}🔄 Changing instance types...{}\n", CYAN, RESET).into_bytes());
-
-    for id in &ids {
-        client
-            .modify_instance_attribute()
-            .instance_id(id)
-            .instance_type(aws_sdk_ec2::types::AttributeValue::builder()
-                .value(&instance_type)
-                .build())
-            .send()
-            .await
-            .unwrap();
-
-        output.extend_from_slice(&format!("   {} {} → {}{}\n", id, MAGENTA, instance_type, RESET).into_bytes());
-    }
-
-    output.extend_from_slice(&format!("\n{}✅ Instance type(s) updated{}\n", GREEN, RESET).into_bytes());
-    output
-}
-
-async fn cmd_terminate(client: &Client, instance_ids: Vec<String>) -> Vec<u8> {
-    let ids = resolve_instance_ids(client, &instance_ids).await;
-    if ids.is_empty() {
-        return Vec::new();
-    }
-
-    let instances = describe_instances_by_ids(client, &ids).await;
-    let table = Table::new(&instances);
-    let mut output = format!("\n{}🗑️ Instances to terminate:{}\n{}", BOLD, RESET, table.to_string()).into_bytes();
-
-    output.extend_from_slice(&format!("\n{}⚠️  WARNING: Termination permanently deletes the instance!{}\n", RED, RESET).into_bytes());
-    output.extend_from_slice(&format!("{}Type \"terminate\" to confirm:{}\n", YELLOW, RESET).into_bytes());
-    std::io::stdout().flush().unwrap();
-
-    let mut confirmation = String::new();
-    std::io::stdin().read_line(&mut confirmation).unwrap();
-
-    if confirmation.trim() != "terminate" {
-        output.clear();
-        output.extend_from_slice(&format!("{}❌ Termination cancelled.{}\n", YELLOW, RESET).into_bytes());
-        return output;
-    }
-
-    client
-        .terminate_instances()
-        .set_instance_ids(Some(ids.clone()))
-        .send()
-        .await
-        .unwrap();
-
-    output.clear();
-    output.extend_from_slice(&format!("\n{}✅ Instance(s) {} terminated successfully{}\n", GREEN, ids.join(", "), RESET).into_bytes());
-    output
-}
-
-async fn resolve_instance_ids(client: &Client, provided_ids: &[String]) -> Vec<String> {
-    if !provided_ids.is_empty() {
-        return provided_ids.to_vec();
-    }
-
-    let instances = describe_instances(client, &[]).await;
-
-    if instances.is_empty() {
-        return Vec::new();
-    }
-
-    println!("\n{}🔍 Available instances:{}\n", CYAN, RESET);
-    for (i, inst) in instances.iter().enumerate() {
-        let state_colored = format!("{}{} {}{}", state_color(&inst.state), state_emoji(&inst.state), inst.state.to_uppercase(), RESET);
-        let name_display = if inst.name != "-" {
-            format!("{}{}{}", BOLD, inst.name, RESET)
-        } else {
-            format!("{}{}{}", DIM, inst.name, RESET)
-        };
-        println!(
-            "  {}. {} | {} | {} | {}",
-            i + 1,
-            inst.instance_id,
-            name_display,
-            inst.instance_type,
-            state_colored
-        );
-    }
-
-    match interactive_select(&instances).await {
-        Some(idx) => vec![instances[idx].instance_id.clone()],
-        None => Vec::new(),
-    }
-}
-
-async fn describe_instances_by_ids(client: &Client, instance_ids: &[String]) -> Vec<InstanceInfo> {
+async fn describe_instances_by_ids(client: &Client, ids: &[String]) -> Vec<InstanceInfo> {
     let resp = client
         .describe_instances()
-        .set_instance_ids(Some(instance_ids.to_vec()))
+        .set_instance_ids(Some(ids.to_vec()))
         .send()
         .await
         .unwrap();
@@ -535,54 +247,320 @@ async fn describe_instances_by_ids(client: &Client, instance_ids: &[String]) -> 
     instances
 }
 
+// ─── Beautiful table style (comfy-table v8 API) ──────────────────────
+const BEAUTIFUL_STYLE: TableStyle = TableStyle::new()
+    .top_border(LineStyle::new('┌', '─', '┬', '┐'))
+    .header_lines(ContentLineStyle::new('│', '┆', '│'))
+    .header_separator(LineStyle::new('╞', '═', '╪', '╡'))
+    .content_lines(ContentLineStyle::new('│', '┆', '│'))
+    .bottom_border(LineStyle::new('└', '─', '┴', '┘'));
+
+// ─── Output helpers ────────────────────────────────────────────────────
+fn render_instance_table(instances: &[InstanceInfo], title: &str) -> String {
+    let mut table = Table::new();
+
+    table.load_style(BEAUTIFUL_STYLE);
+
+    let header = vec![
+        Cell::new("  ID").set_alignment(CellAlignment::Left),
+        Cell::new("  Name").set_alignment(CellAlignment::Left),
+        Cell::new("  Type").set_alignment(CellAlignment::Left),
+        Cell::new("  State").set_alignment(CellAlignment::Left),
+        Cell::new("  Private IP").set_alignment(CellAlignment::Left),
+    ];
+    table.set_header(header);
+
+    for inst in instances {
+        let emoji = state_emoji(&inst.state);
+        let state_display = format!("{} {}", emoji, inst.state.to_uppercase());
+        let row = vec![
+            Cell::new(&inst.instance_id).set_alignment(CellAlignment::Left),
+            Cell::new(&inst.name).set_alignment(CellAlignment::Left),
+            Cell::new(&inst.instance_type).set_alignment(CellAlignment::Left),
+            Cell::new(state_display).set_alignment(CellAlignment::Left),
+            Cell::new(&inst.private_ip).set_alignment(CellAlignment::Left),
+        ];
+        table.add_row(row);
+    }
+
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    format!("\n  {}\n{}", title, table)
+}
+
+fn output_instances(instances: &[InstanceInfo], title: &str, format: &OutputFormat) {
+    match format {
+        OutputFormat::Table => {
+            println!("{}", render_instance_table(instances, title));
+        }
+        OutputFormat::Less => {
+            let content = render_instance_table(instances, title);
+            pipe_to_less(&content);
+        }
+        OutputFormat::Json => {
+            let json = serde_json::json!({
+                "instances": instances,
+                "count": instances.len(),
+            });
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        }
+    }
+}
+
+fn pipe_to_less(content: &str) {
+    let mut child = Command::new("less")
+        .arg("-R")  // Allow ANSI color codes
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn less");
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(content.as_bytes()).unwrap();
+    }
+
+    child.wait().unwrap();
+}
+
+fn output_status(msg: impl AsRef<str>) {
+    println!("  {}", msg.as_ref());
+}
+
+// ─── Command handlers ─────────────────────────────────────────────────
+async fn cmd_list(client: &Client, states: Option<String>, format: &OutputFormat) {
+    let states_vec: Vec<String> = states
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+        .unwrap_or_default();
+
+    let instances = describe_instances(client, &states_vec).await;
+
+    if instances.is_empty() {
+        println!("\n  ⚠️  No instances found.\n");
+        return;
+    }
+
+    let title = format!("EC2 Instances  ({} instance(s))", instances.len());
+    output_instances(&instances, &title, format);
+}
+
+async fn cmd_start(client: &Client, instance_ids: Vec<String>) {
+    let ids = resolve_instance_ids(client, &instance_ids).await;
+    if ids.is_empty() {
+        return;
+    }
+
+    client
+        .start_instances()
+        .set_instance_ids(Some(ids.clone()))
+        .send()
+        .await
+        .unwrap();
+
+    output_status(format!("\u{1F680} Starting {} instance(s)...", ids.len()));
+
+    client
+        .wait_until_instance_running()
+        .set_instance_ids(Some(ids.clone()))
+        .wait(std::time::Duration::from_secs(300))
+        .await
+        .unwrap();
+
+    output_status(format!("\u{2705} Instance(s) {} is now running", ids.join(", ")));
+}
+
+async fn cmd_stop(client: &Client, instance_ids: Vec<String>) {
+    let ids = resolve_instance_ids(client, &instance_ids).await;
+    if ids.is_empty() {
+        return;
+    }
+
+    client
+        .stop_instances()
+        .set_instance_ids(Some(ids.clone()))
+        .send()
+        .await
+        .unwrap();
+
+    output_status(format!("\u{1F6D1} Instance(s) {} stopped", ids.join(", ")));
+}
+
+async fn cmd_restart(client: &Client, instance_ids: Vec<String>) {
+    let ids = resolve_instance_ids(client, &instance_ids).await;
+    if ids.is_empty() {
+        return;
+    }
+
+    output_status(format!("\u{1F504} Restarting {} instance(s)...", ids.len()));
+
+    client
+        .stop_instances()
+        .set_instance_ids(Some(ids.clone()))
+        .send()
+        .await
+        .unwrap();
+
+    client
+        .wait_until_instance_stopped()
+        .set_instance_ids(Some(ids.clone()))
+        .wait(std::time::Duration::from_secs(300))
+        .await
+        .unwrap();
+
+    output_status("\u{23F3} Instances stopped, starting...");
+
+    client
+        .start_instances()
+        .set_instance_ids(Some(ids.clone()))
+        .send()
+        .await
+        .unwrap();
+
+    client
+        .wait_until_instance_running()
+        .set_instance_ids(Some(ids.clone()))
+        .wait(std::time::Duration::from_secs(300))
+        .await
+        .unwrap();
+
+    output_status(format!("\u{2705} Instance(s) {} restarted successfully", ids.join(", ")));
+}
+
+async fn cmd_wait(client: &Client, instance_ids: Vec<String>) {
+    let ids = resolve_instance_ids(client, &instance_ids).await;
+    if ids.is_empty() {
+        return;
+    }
+
+    output_status(format!("\u{23F3} Waiting for {} instance(s) to stop...", ids.len()));
+
+    client
+        .wait_until_instance_stopped()
+        .set_instance_ids(Some(ids.clone()))
+        .wait(std::time::Duration::from_secs(300))
+        .await
+        .unwrap();
+
+    output_status(format!("\u{2705} Instance(s) {} are now stopped", ids.join(", ")));
+}
+
+async fn cmd_change_type(client: &Client, instance_type: String, instance_ids: Vec<String>) {
+    let ids = resolve_instance_ids(client, &instance_ids).await;
+    if ids.is_empty() {
+        return;
+    }
+
+    output_status(format!("\u{1F527} Changing instance type to {}...", instance_type));
+
+    for id in &ids {
+        client
+            .modify_instance_attribute()
+            .instance_id(id)
+            .instance_type(aws_sdk_ec2::types::AttributeValue::builder()
+                .value(&instance_type)
+                .build())
+            .send()
+            .await
+            .unwrap();
+
+        output_status(format!("     {} \u{2192} {}", id, instance_type));
+    }
+
+    output_status("\u{2705} Instance type(s) updated");
+}
+
+async fn cmd_terminate(client: &Client, instance_ids: Vec<String>, format: &OutputFormat) {
+    let ids = resolve_instance_ids(client, &instance_ids).await;
+    if ids.is_empty() {
+        return;
+    }
+
+    let instances = describe_instances_by_ids(client, &ids).await;
+
+    let title = "\u{1F4CB} Instances to terminate";
+    output_instances(&instances, title, format);
+
+    println!(
+        "\n  \u{26A0}  WARNING: Termination permanently deletes the instance!"
+    );
+    print!("  Type \"terminate\" to confirm: ");
+    std::io::stdout().flush().unwrap();
+
+    let mut confirmation = String::new();
+    std::io::stdin().read_line(&mut confirmation).unwrap();
+
+    if confirmation.trim() != "terminate" {
+        println!("  \u{274C} Termination cancelled.");
+        return;
+    }
+
+    client
+        .terminate_instances()
+        .set_instance_ids(Some(ids.clone()))
+        .send()
+        .await
+        .unwrap();
+
+    println!("\n  \u{1F480} Instance(s) {} terminated successfully", ids.join(", "));
+}
+
+async fn resolve_instance_ids(client: &Client, provided_ids: &[String]) -> Vec<String> {
+    if !provided_ids.is_empty() {
+        return provided_ids.to_vec();
+    }
+
+    let instances = describe_instances(client, &[]).await;
+
+    if instances.is_empty() {
+        return Vec::new();
+    }
+
+    let title = "\u{1F4CB} Available instances";
+    println!("\n{}", render_instance_table(&instances, title));
+
+    print!("  Enter instance number (or 0 to cancel): ");
+    std::io::stdout().flush().unwrap();
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).unwrap();
+    let num: usize = input.trim().parse().unwrap_or(0);
+    if num > 0 && num <= instances.len() {
+        vec![instances[num - 1].instance_id.clone()]
+    } else {
+        Vec::new()
+    }
+}
+
+// ─── Main ──────────────────────────────────────────────────────────────
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
-    let profile = match &cli.command {
-        Commands::List { profile, .. } => &profile.profile,
-        Commands::Start { profile, .. } => &profile.profile,
-        Commands::Stop { profile, .. } => &profile.profile,
-        Commands::Restart { profile, .. } => &profile.profile,
-        Commands::Wait { profile, .. } => &profile.profile,
-        Commands::ChangeType { profile, .. } => &profile.profile,
-        Commands::Terminate { profile, .. } => &profile.profile,
-    };
-
-    let client = get_client(profile).await;
-
     match cli.command {
-        Commands::List { state, .. } => {
-            let output = cmd_list(&client, state).await;
-            print!("{}", String::from_utf8_lossy(&output));
+        Commands::List { profile, state, output } => {
+            let client = get_client(&profile.profile).await;
+            cmd_list(&client, state, &output).await;
         }
-        Commands::Start { instance_ids, .. } => {
-            let output = cmd_start(&client, instance_ids).await;
-            print!("{}", String::from_utf8_lossy(&output));
+        Commands::Start { profile, instance_ids } => {
+            let client = get_client(&profile.profile).await;
+            cmd_start(&client, instance_ids).await;
         }
-        Commands::Stop { instance_ids, .. } => {
-            let output = cmd_stop(&client, instance_ids).await;
-            print!("{}", String::from_utf8_lossy(&output));
+        Commands::Stop { profile, instance_ids } => {
+            let client = get_client(&profile.profile).await;
+            cmd_stop(&client, instance_ids).await;
         }
-        Commands::Restart { instance_ids, .. } => {
-            let output = cmd_restart(&client, instance_ids).await;
-            print!("{}", String::from_utf8_lossy(&output));
+        Commands::Restart { profile, instance_ids } => {
+            let client = get_client(&profile.profile).await;
+            cmd_restart(&client, instance_ids).await;
         }
-        Commands::Wait { instance_ids, .. } => {
-            let output = cmd_wait(&client, instance_ids).await;
-            print!("{}", String::from_utf8_lossy(&output));
+        Commands::Wait { profile, instance_ids } => {
+            let client = get_client(&profile.profile).await;
+            cmd_wait(&client, instance_ids).await;
         }
-        Commands::ChangeType {
-            instance_type,
-            instance_ids,
-            ..
-        } => {
-            let output = cmd_change_type(&client, instance_type, instance_ids).await;
-            print!("{}", String::from_utf8_lossy(&output));
+        Commands::ChangeType { profile, instance_type, instance_ids } => {
+            let client = get_client(&profile.profile).await;
+            cmd_change_type(&client, instance_type, instance_ids).await;
         }
-        Commands::Terminate { instance_ids, .. } => {
-            let output = cmd_terminate(&client, instance_ids).await;
-            print!("{}", String::from_utf8_lossy(&output));
+        Commands::Terminate { profile, instance_ids, output } => {
+            let client = get_client(&profile.profile).await;
+            cmd_terminate(&client, instance_ids, &output).await;
         }
     }
 }
